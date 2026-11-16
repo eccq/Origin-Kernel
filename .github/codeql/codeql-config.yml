@@ -1,0 +1,4 @@
+name: bakasu scan
+paths:
+  - KernelSU/kernel
+  - drivers/kernelsu
