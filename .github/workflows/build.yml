@@ -1,0 +1,166 @@
+name: build kernel
+
+on:
+  workflow_dispatch:
+    inputs:
+      root:
+        description: root manager to build in
+        type: choice
+        default: bakasu
+        options: [bakasu, kernelsu, kernelsu-next, sukisu-ultra, none]
+      root_ref:
+        description: tag, branch or commit of the root manager (empty = latest tag)
+        type: string
+        default: ""
+      release:
+        description: publish a github release with the zip and boot.img
+        type: boolean
+        default: true
+
+permissions:
+  contents: write
+
+env:
+  CLANG_URL: https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/refs/heads/mirror-goog-main-llvm-toolchain-source/clang-r596125.tar.gz
+  BOOT_BASE: https://github.com/eccq/android_device_nothing_Tetris/releases/download/v1.0-20261116-user/DescartesOS-boot-Origin-Vanilla-BakaSU.img
+  AVB_KEY_SHA1: cdbb77177f731920bbe0a0f94f84d9038ae0617d
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 300
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+          df -h /
+
+      - name: install build tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y bc bison flex libssl-dev libelf-dev dwarves lz4 zip cpio python3
+          pahole --version
+
+      - name: cache clang
+        id: clang
+        uses: actions/cache@v4
+        with:
+          path: ~/clang
+          key: clang-r596125
+
+      - name: download clang r596125
+        if: steps.clang.outputs.cache-hit != 'true'
+        run: |
+          mkdir -p ~/clang
+          curl -fL --retry 5 "$CLANG_URL" | tar -xz -C ~/clang
+          ~/clang/bin/clang --version | head -1
+
+      - name: add root manager
+        env:
+          ROOT: ${{ inputs.root }}
+          REF: ${{ inputs.root_ref }}
+        run: |
+          rm -rf KernelSU
+          case "$ROOT" in
+            bakasu)        repo=https://github.com/Baka-SU/BakaSU ;;
+            kernelsu)      repo=https://github.com/tiann/KernelSU ;;
+            kernelsu-next) repo=https://github.com/KernelSU-Next/KernelSU-Next ;;
+            sukisu-ultra)  repo=https://github.com/SukiSU-Ultra/SukiSU-Ultra ;;
+            none)          repo= ;;
+          esac
+          if [ -z "$repo" ]; then
+            rm -f drivers/kernelsu
+            sed -i '/drivers\/kernelsu\/Kconfig/d' drivers/Kconfig
+            sed -i '/kernelsu\//d' drivers/Makefile
+            echo "ROOT_VERSION=none" >> "$GITHUB_ENV"
+            exit 0
+          fi
+          # full history: the drivers count commits to get their version number
+          git clone -q "$repo" KernelSU
+          if [ -z "$REF" ]; then REF=$(git -C KernelSU describe --tags --abbrev=0); fi
+          git -C KernelSU checkout -q "$REF"
+          ln -sfn ../KernelSU/kernel drivers/kernelsu
+          echo "ROOT_VERSION=$REF" >> "$GITHUB_ENV"
+          echo "$ROOT at $REF ($(git -C KernelSU rev-list --count HEAD) commits)"
+
+      - name: build
+        env:
+          ROOT: ${{ inputs.root }}
+        run: |
+          export PATH=~/clang/bin:$PATH KBUILD_BUILD_USER=chakra KBUILD_BUILD_HOST=origin
+          : > .scmversion
+          M="make O=out ARCH=arm64 LLVM=1 LLVM_IAS=1 CROSS_COMPILE=aarch64-linux-gnu-"
+          $M gki_defconfig
+          suffix=-Origin-Vanilla
+          [ "$ROOT" != none ] && suffix="$suffix-$ROOT"
+          # BTF stays on: without it the symbol crcs change and the rom's modules won't load.
+          scripts/config --file out/.config -d LTO_CLANG_FULL -e LTO_CLANG_THIN \
+            -e DEBUG_INFO_BTF -d LOCALVERSION_AUTO --set-str LOCALVERSION "$suffix"
+          [ "$ROOT" != none ] && scripts/config --file out/.config -e KSU
+          $M olddefconfig
+          grep -q '^CONFIG_PAHOLE_HAS_BTF_TAG=y' out/.config || { echo "pahole too old for btf tags"; exit 1; }
+          if [ "$ROOT" != none ]; then grep -q '^CONFIG_KSU=y' out/.config || { echo "root driver not enabled"; exit 1; }; fi
+          $M -j"$(nproc)"
+          ver=$(strings out/arch/arm64/boot/Image | grep -m1 -o 'Linux version [^ ]*' | cut -d' ' -f3)
+          echo "KVER=$ver" >> "$GITHUB_ENV"
+          echo "built $ver"
+
+      - name: check module abi
+        run: |
+          python3 .github/scripts/kmi_crc_check.py android/abi_gki_aarch64.stg out/Module.symvers \
+            android/abi_gki_aarch64_mtk android/abi_gki_aarch64_nothing
+
+      - name: package anykernel3 and boot.img
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          mkdir -p dist ak3 tools
+          gh release download v3-vanilla -R samakshkambxj/Origin-Kernel -p '*AnyKernel3.zip' -O origin-ak3.zip
+          (cd ak3 && unzip -q ../origin-ak3.zip)
+          cp out/arch/arm64/boot/Image ak3/Image
+          sed -i "s/^kernel.string=.*/kernel.string=Origin Kernel Vanilla ($ROOT_VERSION) by samakshkambxj, chakra/" ak3/anykernel.sh
+          name="Origin-Vanilla-${{ inputs.root }}-$KVER"
+          (cd ak3 && zip -qr9 "../dist/$name-AnyKernel3.zip" .)
+
+          git clone -q --depth 1 https://android.googlesource.com/platform/system/tools/mkbootimg tools/mkbootimg
+          git clone -q --depth 1 https://android.googlesource.com/platform/external/avb tools/avb
+          curl -fL --retry 5 -o base-boot.img "$BOOT_BASE"
+          python3 tools/mkbootimg/unpack_bootimg.py --boot_img base-boot.img --out bootx >/dev/null
+          lz4 -l -12 -f -q out/arch/arm64/boot/Image bootx/kernel
+          python3 tools/mkbootimg/mkbootimg.py --header_version 4 --os_version 17.0.0 --os_patch_level 2026-11 \
+            --kernel bootx/kernel --ramdisk bootx/ramdisk --cmdline '' --output "dist/$name-boot.img"
+          python3 tools/avb/avbtool.py add_hash_footer --image "dist/$name-boot.img" --partition_size 67108864 \
+            --partition_name boot --key tools/avb/test/data/testkey_rsa2048.pem --algorithm SHA256_RSA2048 \
+            --rollback_index 0 --prop com.android.build.boot.os_version:17 --prop com.android.build.boot.security_patch:2026-04-05
+          python3 tools/avb/avbtool.py info_image --image "dist/$name-boot.img" | grep -q "$AVB_KEY_SHA1" \
+            || { echo "boot.img not signed with the rom key"; exit 1; }
+          (cd dist && sha256sum * > sha256sums.txt)
+          ls -la dist
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: origin-vanilla-${{ inputs.root }}-${{ env.KVER }}
+          path: dist/
+          if-no-files-found: error
+
+      - name: release
+        if: inputs.release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          tag="${{ inputs.root }}-${ROOT_VERSION}-r${{ github.run_number }}"
+          {
+            echo "origin kernel vanilla \`$KVER\` with ${{ inputs.root }} \`$ROOT_VERSION\`, for the cmf phone 1 (tetris)."
+            echo
+            echo "the build checked every vendor symbol crc against the android kmi before packaging (0 mismatches), so the rom's modules load."
+            echo
+            echo "- \`*-AnyKernel3.zip\`: flash from recovery, swaps only the kernel."
+            echo "- \`*-boot.img\`: descartesos boot image with this kernel. \`fastboot flash boot <file>\`"
+            echo "- install the matching manager, then reboot once so the kernel finds it."
+          } > notes.md
+          gh release create "$tag" dist/* --target "${{ github.ref_name }}" \
+            --title "origin vanilla $KVER + ${{ inputs.root }} $ROOT_VERSION" --notes-file notes.md
