@@ -7,7 +7,11 @@ on:
         description: root manager to build in
         type: choice
         default: bakasu
-        options: [bakasu, kernelsu, kernelsu-next, sukisu-ultra, none]
+        options: [bakasu, resukisu, kernelsu, kernelsu-next, sukisu-ultra, finasu, kowsu, yukisu, custom, none]
+      custom_repo:
+        description: git url of any kernelsu fork, used when root is custom (needs a kernel/ dir)
+        type: string
+        default: ""
       root_ref:
         description: tag, branch or commit of the root manager (empty = latest tag)
         type: string
@@ -63,13 +67,19 @@ jobs:
         env:
           ROOT: ${{ inputs.root }}
           REF: ${{ inputs.root_ref }}
+          CUSTOM_REPO: ${{ inputs.custom_repo }}
         run: |
           rm -rf KernelSU
           case "$ROOT" in
-            bakasu)        repo=https://github.com/Baka-SU/BakaSU ;;
+            bakasu|resukisu) repo=https://github.com/Baka-SU/BakaSU ;;
             kernelsu)      repo=https://github.com/tiann/KernelSU ;;
             kernelsu-next) repo=https://github.com/KernelSU-Next/KernelSU-Next ;;
             sukisu-ultra)  repo=https://github.com/SukiSU-Ultra/SukiSU-Ultra ;;
+            finasu)        repo=https://github.com/LyraVoid/FinaSU ;;
+            kowsu)         repo=https://github.com/KOWX712/KernelSU ;;
+            yukisu)        repo=https://github.com/Rouyashiki/YukiSU ;;
+            custom)        repo="$CUSTOM_REPO"
+                           [ -n "$repo" ] || { echo "root is custom but custom_repo is empty"; exit 1; } ;;
             none)          repo= ;;
           esac
           if [ -z "$repo" ]; then
@@ -81,8 +91,11 @@ jobs:
           fi
           # full history: the drivers count commits to get their version number
           git clone -q "$repo" KernelSU
-          if [ -z "$REF" ]; then REF=$(git -C KernelSU describe --tags --abbrev=0); fi
+          if [ -z "$REF" ]; then
+            REF=$(git -C KernelSU describe --tags --abbrev=0 2>/dev/null || git -C KernelSU rev-parse --short HEAD)
+          fi
           git -C KernelSU checkout -q "$REF"
+          [ -f KernelSU/kernel/Kconfig ] || { echo "$repo has no kernel/Kconfig, not a kernelsu fork"; exit 1; }
           ln -sfn ../KernelSU/kernel drivers/kernelsu
           echo "ROOT_VERSION=$REF" >> "$GITHUB_ENV"
           echo "$ROOT at $REF ($(git -C KernelSU rev-list --count HEAD) commits)"
