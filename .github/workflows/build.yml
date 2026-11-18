@@ -1,4 +1,5 @@
 name: build kernel
+run-name: vanilla-${{ inputs.root }} #${{ github.run_number }}
 
 on:
   workflow_dispatch:
@@ -113,10 +114,16 @@ jobs:
           # BTF stays on: without it the symbol crcs change and the rom's modules won't load.
           scripts/config --file out/.config -d LTO_CLANG_FULL -e LTO_CLANG_THIN \
             -e DEBUG_INFO_BTF -d LOCALVERSION_AUTO --set-str LOCALVERSION "$suffix"
-          [ "$ROOT" != none ] && scripts/config --file out/.config -e KSU
+          if [ "$ROOT" != none ]; then
+            scripts/config --file out/.config -e KPROBES -e EXT4_FS -e KSU
+          fi
           $M olddefconfig
           grep -q '^CONFIG_PAHOLE_HAS_BTF_TAG=y' out/.config || { echo "pahole too old for btf tags"; exit 1; }
-          if [ "$ROOT" != none ]; then grep -q '^CONFIG_KSU=y' out/.config || { echo "root driver not enabled"; exit 1; }; fi
+          if [ "$ROOT" != none ] && ! grep -q '^CONFIG_KSU=y' out/.config; then
+            echo "root driver not enabled after olddefconfig; relevant settings:"
+            grep -E '^(CONFIG_(KSU|KPROBES|EXT4_FS)=|# CONFIG_(KSU|KPROBES|EXT4_FS) is not set)' out/.config || true
+            exit 1
+          fi
           $M -j"$(nproc)"
           ver=$(strings out/arch/arm64/boot/Image | grep -m1 -o 'Linux version [^ ]*' | cut -d' ' -f3)
           echo "KVER=$ver" >> "$GITHUB_ENV"
